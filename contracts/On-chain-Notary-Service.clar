@@ -5,6 +5,8 @@
 (define-constant err-invalid-hash (err u103))
 (define-constant err-unauthorized (err u104))
 (define-constant err-invalid-signature (err u105))
+(define-constant err-document-expired (err u106))
+(define-constant err-invalid-duration (err u107))
 
 (define-map documents
     { hash: (buff 32) }
@@ -16,6 +18,9 @@
         metadata: (string-utf8 256),
         verified: bool,
         revoked: bool,
+        expires-at: uint,
+        renewable: bool,
+        renewal-count: uint,
     }
 )
 
@@ -41,6 +46,21 @@
 (define-data-var total-documents uint u0)
 (define-data-var total-notaries uint u0)
 (define-data-var service-fee uint u1000000)
+(define-data-var default-validity-period uint u52560)
+(define-data-var renewal-fee uint u500000)
+
+(define-map document-renewals
+    {
+        hash: (buff 32),
+        renewal-id: uint,
+    }
+    {
+        renewed-by: principal,
+        renewed-at: uint,
+        new-expires-at: uint,
+        renewal-fee-paid: uint,
+    }
+)
 
 (define-private (is-authorized-notary (notary principal))
     (match (map-get? notary-registry { notary: notary })
@@ -68,6 +88,17 @@
         )
         false
     )
+)
+
+(define-private (is-document-expired (document-hash (buff 32)))
+    (match (map-get? documents { hash: document-hash })
+        document-entry (> burn-block-height (get expires-at document-entry))
+        true
+    )
+)
+
+(define-private (calculate-expiration-date (validity-period uint))
+    (+ burn-block-height validity-period)
 )
 
 (define-public (register-notary)
@@ -121,6 +152,44 @@
             metadata: metadata,
             verified: false,
             revoked: false,
+            expires-at: (calculate-expiration-date (var-get default-validity-period)),
+            renewable: true,
+            renewal-count: u0,
+        })
+        (increment-notary-count tx-sender)
+        (var-set total-documents (+ (var-get total-documents) u1))
+        (ok document-hash)
+    )
+)
+
+(define-public (notarize-document-with-expiration
+        (document-hash (buff 32))
+        (signature (buff 65))
+        (metadata (string-utf8 256))
+        (validity-period uint)
+        (is-renewable bool)
+    )
+    (begin
+        (asserts! (is-authorized-notary tx-sender) err-unauthorized)
+        (asserts! (is-none (map-get? documents { hash: document-hash }))
+            err-document-exists
+        )
+        (asserts! (> (len document-hash) u0) err-invalid-hash)
+        (asserts! (and (> validity-period u0) (<= validity-period u262800))
+            err-invalid-duration
+        )
+        (try! (stx-transfer? (var-get service-fee) tx-sender contract-owner))
+        (map-set documents { hash: document-hash } {
+            notary: tx-sender,
+            timestamp: burn-block-height,
+            block-height: burn-block-height,
+            signature: signature,
+            metadata: metadata,
+            verified: false,
+            revoked: false,
+            expires-at: (calculate-expiration-date validity-period),
+            renewable: is-renewable,
+            renewal-count: u0,
         })
         (increment-notary-count tx-sender)
         (var-set total-documents (+ (var-get total-documents) u1))
@@ -136,6 +205,9 @@
         document-entry (begin
             (asserts! (is-authorized-notary tx-sender) err-unauthorized)
             (asserts! (not (get revoked document-entry)) err-document-not-found)
+            (asserts! (not (is-document-expired document-hash))
+                err-document-expired
+            )
             (map-set documents { hash: document-hash }
                 (merge document-entry { verified: true })
             )
@@ -173,11 +245,75 @@
     )
 )
 
+(define-public (renew-document
+        (document-hash (buff 32))
+        (extension-period uint)
+    )
+    (match (map-get? documents { hash: document-hash })
+        document-entry (begin
+            (asserts! (get renewable document-entry) err-unauthorized)
+            (asserts!
+                (or
+                    (is-eq tx-sender (get notary document-entry))
+                    (is-authorized-notary tx-sender)
+                )
+                err-unauthorized
+            )
+            (asserts! (and (> extension-period u0) (<= extension-period u262800))
+                err-invalid-duration
+            )
+            (try! (stx-transfer? (var-get renewal-fee) tx-sender contract-owner))
+            (let (
+                    (new-expiration (+ (get expires-at document-entry) extension-period))
+                    (current-renewals (get renewal-count document-entry))
+                )
+                (map-set documents { hash: document-hash }
+                    (merge document-entry {
+                        expires-at: new-expiration,
+                        renewal-count: (+ current-renewals u1),
+                    })
+                )
+                (map-set document-renewals {
+                    hash: document-hash,
+                    renewal-id: (+ current-renewals u1),
+                } {
+                    renewed-by: tx-sender,
+                    renewed-at: burn-block-height,
+                    new-expires-at: new-expiration,
+                    renewal-fee-paid: (var-get renewal-fee),
+                })
+                (update-reputation tx-sender u3)
+                (ok new-expiration)
+            )
+        )
+        err-document-not-found
+    )
+)
+
 (define-public (update-service-fee (new-fee uint))
     (begin
         (asserts! (is-eq tx-sender contract-owner) err-owner-only)
         (var-set service-fee new-fee)
         (ok new-fee)
+    )
+)
+
+(define-public (update-renewal-fee (new-fee uint))
+    (begin
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (var-set renewal-fee new-fee)
+        (ok new-fee)
+    )
+)
+
+(define-public (update-default-validity-period (new-period uint))
+    (begin
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (asserts! (and (> new-period u0) (<= new-period u262800))
+            err-invalid-duration
+        )
+        (var-set default-validity-period new-period)
+        (ok new-period)
     )
 )
 
@@ -198,8 +334,42 @@
         document-entry (and
             (not (get revoked document-entry))
             (get verified document-entry)
+            (not (is-document-expired document-hash))
         )
         false
+    )
+)
+
+(define-read-only (get-document-expiration (document-hash (buff 32)))
+    (match (map-get? documents { hash: document-hash })
+        document-entry (some (get expires-at document-entry))
+        none
+    )
+)
+
+(define-read-only (get-document-renewal-info
+        (document-hash (buff 32))
+        (renewal-id uint)
+    )
+    (map-get? document-renewals {
+        hash: document-hash,
+        renewal-id: renewal-id,
+    })
+)
+
+(define-read-only (check-document-expiration-status (document-hash (buff 32)))
+    (match (map-get? documents { hash: document-hash })
+        document-entry (ok {
+            expires-at: (get expires-at document-entry),
+            is-expired: (is-document-expired document-hash),
+            is-renewable: (get renewable document-entry),
+            renewal-count: (get renewal-count document-entry),
+            blocks-until-expiry: (if (> (get expires-at document-entry) burn-block-height)
+                (- (get expires-at document-entry) burn-block-height)
+                u0
+            ),
+        })
+        err-document-not-found
     )
 )
 
@@ -233,6 +403,14 @@
     contract-owner
 )
 
+(define-read-only (get-renewal-fee)
+    (var-get renewal-fee)
+)
+
+(define-read-only (get-default-validity-period)
+    (var-get default-validity-period)
+)
+
 (define-public (verify-document-hash
         (original-data (buff 256))
         (claimed-hash (buff 32))
@@ -242,12 +420,14 @@
     )
 )
 
-(define-public (batch-notarize (doc-list (list 10
+(define-public (batch-notarize (doc-list (list
+    10
     {
-    hash: (buff 32),
-    signature: (buff 65),
-    metadata: (string-utf8 256),
-})))
+        hash: (buff 32),
+        signature: (buff 65),
+        metadata: (string-utf8 256),
+    }
+)))
     (let ((fee-total (* (var-get service-fee) (len doc-list))))
         (asserts! (is-authorized-notary tx-sender) err-unauthorized)
         (try! (stx-transfer? fee-total tx-sender contract-owner))
@@ -271,6 +451,9 @@
                     metadata: (get metadata doc),
                     verified: false,
                     revoked: false,
+                    expires-at: (calculate-expiration-date (var-get default-validity-period)),
+                    renewable: true,
+                    renewal-count: u0,
                 })
                 (increment-notary-count tx-sender)
                 (var-set total-documents (+ (var-get total-documents) u1))

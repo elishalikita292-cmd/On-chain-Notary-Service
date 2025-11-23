@@ -62,6 +62,23 @@
     }
 )
 
+(define-map document-access-logs
+    {
+        hash: (buff 32),
+        access-id: uint,
+    }
+    {
+        accessor: principal,
+        accessed-at: uint,
+        purpose: (string-utf8 128),
+    }
+)
+
+(define-map document-access-counts
+    { hash: (buff 32) }
+    { count: uint }
+)
+
 (define-private (is-authorized-notary (notary principal))
     (match (map-get? notary-registry { notary: notary })
         registry-entry (get authorized registry-entry)
@@ -489,6 +506,51 @@
         document-entry (- burn-block-height (get block-height document-entry))
         u0
     )
+)
+
+(define-public (record-document-access
+        (document-hash (buff 32))
+        (purpose (string-utf8 128))
+    )
+    (match (map-get? documents { hash: document-hash })
+        document-entry (let (
+                (maybe-count (map-get? document-access-counts { hash: document-hash }))
+                (current-count (match maybe-count
+                    access-entry (get count access-entry)
+                    u0
+                ))
+                (next-count (+ current-count u1))
+            )
+            (map-set document-access-counts { hash: document-hash } { count: next-count })
+            (map-set document-access-logs {
+                hash: document-hash,
+                access-id: next-count,
+            } {
+                accessor: tx-sender,
+                accessed-at: burn-block-height,
+                purpose: purpose,
+            })
+            (ok next-count)
+        )
+        err-document-not-found
+    )
+)
+
+(define-read-only (get-document-access-count (document-hash (buff 32)))
+    (match (map-get? document-access-counts { hash: document-hash })
+        access-entry (get count access-entry)
+        u0
+    )
+)
+
+(define-read-only (get-document-access-log
+        (document-hash (buff 32))
+        (access-id uint)
+    )
+    (map-get? document-access-logs {
+        hash: document-hash,
+        access-id: access-id,
+    })
 )
 
 (define-public (challenge-document
